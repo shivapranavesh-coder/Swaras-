@@ -156,7 +156,7 @@
   }
 
   canvas#liveCanvas{
-    width:100%; height:150px; display:block; border-radius:10px;
+    width:100%; height:320px; display:block; border-radius:10px;
     background: #0F0A05; border:1px solid var(--line);
   }
 
@@ -400,7 +400,7 @@
     }
 
     // absolute threshold — find first dip below threshold, then its local minimum
-    const threshold = 0.15;
+    const threshold = 0.1;
     let tauEstimate = -1;
     for (let tau=2; tau<half; tau++){
       if (yinBuf[tau] < threshold){
@@ -439,48 +439,73 @@
   const liveStatus = document.getElementById('liveStatus');
   const liveCanvas = document.getElementById('liveCanvas');
   const lctx = liveCanvas.getContext('2d');
-  let canvasReady = false;
 
   function resizeCanvas(){
     const rect = liveCanvas.getBoundingClientRect();
     liveCanvas.width = Math.max(300, Math.round(rect.width * 2));
-    liveCanvas.height = Math.round(150 * 2);
-    canvasReady = false;
+    liveCanvas.height = Math.round(320 * 2);
   }
-  window.addEventListener('resize', resizeCanvas);
+  window.addEventListener('resize', function(){ resizeCanvas(); drawLiveGraph(liveHistory.length ? liveHistory[liveHistory.length-1].t : 0); });
   resizeCanvas();
 
-  function initCanvasBg(){
-    lctx.fillStyle = '#0F0A05';
-    lctx.fillRect(0,0,liveCanvas.width, liveCanvas.height);
-    lctx.strokeStyle = 'rgba(60,47,23,0.6)';
-    lctx.lineWidth = 1;
-    for (let i=1;i<4;i++){
-      const y = (liveCanvas.height/4)*i;
-      lctx.beginPath(); lctx.moveTo(0,y); lctx.lineTo(liveCanvas.width,y); lctx.stroke();
-    }
-    canvasReady = true;
-  }
+  // History buffer of raw (undebounced) pitch samples, so fast ornaments
+  // (gamak) and slides (meend) are captured exactly as sung, not smoothed.
+  const GRAPH_WINDOW_SEC = 8;
+  const SEMI_RANGE = 15; // +/- semitones shown on live graph (1.25 octaves)
+  let liveHistory = []; // { t, semis } — semis is null during silence/gaps
 
-  const SEMI_RANGE = 15; // +/- semitones shown on live graph
   function semiToY(semi){
     const clamped = Math.max(-SEMI_RANGE, Math.min(SEMI_RANGE, semi));
     return liveCanvas.height - ((clamped + SEMI_RANGE) / (SEMI_RANGE*2)) * liveCanvas.height;
   }
 
-  function drawLiveColumn(semis){
-    if (!canvasReady) initCanvasBg();
-    lctx.drawImage(liveCanvas, -2, 0);
+  function drawLiveGraph(now){
+    const W = liveCanvas.width, H = liveCanvas.height;
     lctx.fillStyle = '#0F0A05';
-    lctx.fillRect(liveCanvas.width-2, 0, 2, liveCanvas.height);
-    if (semis !== null){
-      const y = semiToY(semis);
-      lctx.fillStyle = '#F0C267';
+    lctx.fillRect(0, 0, W, H);
+
+    const labelW = Math.round(30 * (W/1200)); // reserve a small left margin for labels
+    lctx.font = Math.max(9, Math.round(H/34)) + 'px Manrope, sans-serif';
+    lctx.textBaseline = 'middle';
+
+    for (let s = -SEMI_RANGE; s <= SEMI_RANGE; s++){
+      const y = semiToY(s);
+      const idx = ((s % 12) + 12) % 12;
+      const isSa = (s % 12 === 0);
+      lctx.strokeStyle = isSa ? 'rgba(217,165,68,0.55)' : 'rgba(60,47,23,0.65)';
+      lctx.lineWidth = isSa ? 1.6 : 1;
       lctx.beginPath();
-      lctx.arc(liveCanvas.width-3, y, 2.6, 0, Math.PI*2);
-      lctx.fill();
+      lctx.moveTo(labelW, y);
+      lctx.lineTo(W, y);
+      lctx.stroke();
+      lctx.fillStyle = isSa ? 'rgba(240,194,103,0.9)' : 'rgba(171,152,119,0.55)';
+      lctx.fillText(SWARA[idx], 4, y);
     }
+
+    // plot the raw pitch trace, leaving gaps where there was no pitch
+    lctx.strokeStyle = '#F0C267';
+    lctx.lineWidth = Math.max(1.6, H/200);
+    lctx.lineJoin = 'round';
+    lctx.lineCap = 'round';
+    let drawing = false;
+    for (let i=0; i<liveHistory.length; i++){
+      const pt = liveHistory[i];
+      const x = labelW + (W - labelW) * (1 - (now - pt.t) / GRAPH_WINDOW_SEC);
+      if (pt.semis === null){ drawing = false; continue; }
+      const y = semiToY(pt.semis);
+      if (!drawing){ lctx.beginPath(); lctx.moveTo(x, y); drawing = true; }
+      else lctx.lineTo(x, y);
+    }
+    if (drawing) lctx.stroke();
   }
+
+  function pushLiveSample(now, semis){
+    liveHistory.push({ t: now, semis: semis });
+    while (liveHistory.length && now - liveHistory[0].t > GRAPH_WINDOW_SEC + 0.5) liveHistory.shift();
+    drawLiveGraph(now);
+  }
+
+  drawLiveGraph(0);
 
   let tapSaMode = false;
   document.getElementById('tapSaBtn').addEventListener('click', function(){
@@ -502,13 +527,13 @@
     liveStatus.textContent = '';
     liveStatus.className = 'status-msg';
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:true } })
-      .then(function(stream){
+        .then(function(stream){
         micStream = stream;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
         const source = audioCtx.createMediaStreamSource(stream);
         const gainNode = audioCtx.createGain();
-        gainNode.gain.value = 4.0; // boost quiet phone mics so they clear the silence threshold
+        gainNode.gain.value = 2.5; // boost quiet phone mics without clipping louder ones
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 2048;
         source.connect(gainNode);
@@ -516,7 +541,7 @@
         micActive = true;
         micBtn.textContent = 'Stop listening';
         micBtn.classList.add('danger');
-        initCanvasBg();
+        liveHistory = [];
         loopLive();
       })
       .catch(function(err){
@@ -537,11 +562,13 @@
     liveSwaraEl.classList.remove('active');
     liveSwaraSub.textContent = 'Waiting for sound…';
     centsFill.style.left = '50%';
+    liveHistory = [];
+    drawLiveGraph(0);
   }
 
   let tapSamples = [];
   let pendingIdx = null, pendingCount = 0, lastShownIdx = null;
-  const DEBOUNCE_FRAMES = 2;
+  const DEBOUNCE_FRAMES = 5;
 
   function loopLive(){
     if (!micActive) return;
@@ -583,12 +610,12 @@
       }
       const pct = 50 + Math.max(-50, Math.min(50, result.cents/50*50));
       centsFill.style.left = pct + '%';
-      drawLiveColumn(result.semis);
+      pushLiveSample(audioCtx.currentTime, result.semis);
     } else {
       pendingIdx = null; pendingCount = 0; lastShownIdx = null;
       liveSwaraEl.classList.remove('active');
       if (!tapSaMode) liveSwaraSub.textContent = 'Waiting for sound…';
-      drawLiveColumn(null);
+      pushLiveSample(audioCtx.currentTime, null);
     }
     rafId = requestAnimationFrame(loopLive);
   }
