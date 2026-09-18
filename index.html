@@ -375,7 +375,7 @@
     let rms = 0;
     for (let i=0;i<SIZE;i++){ rms += buf[i]*buf[i]; }
     rms = Math.sqrt(rms/SIZE);
-    if (rms < 0.008) return -1;
+    if (rms < 0.0025) return -1;
 
     const half = Math.floor(SIZE/2);
     if (half < 8) return -1;
@@ -501,14 +501,18 @@
   function startMic(){
     liveStatus.textContent = '';
     liveStatus.className = 'status-msg';
-    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } })
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:true } })
       .then(function(stream){
         micStream = stream;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
         const source = audioCtx.createMediaStreamSource(stream);
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 4.0; // boost quiet phone mics so they clear the silence threshold
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 2048;
-        source.connect(analyser);
+        source.connect(gainNode);
+        gainNode.connect(analyser);
         micActive = true;
         micBtn.textContent = 'Stop listening';
         micBtn.classList.add('danger');
