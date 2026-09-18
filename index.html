@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Swara Finder</title>
+<title>Swara Finder v7</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -111,6 +111,7 @@
   }
   .btn.primary:hover{ background:var(--gold-bright); color:#20150A; }
   .btn.danger{ border-color:var(--vermillion); color:var(--vermillion); }
+  .btn.held{ background:var(--sitar-green); border-color:var(--sitar-green); color:#0F1B0A; }
   .btn:disabled{ opacity:0.45; cursor:not-allowed; }
   .sa-freq{ margin-left:auto; color:var(--ink-faint); font-size:0.82rem; }
 
@@ -160,7 +161,7 @@
     background: #0F0A05; border:1px solid var(--line);
   }
 
-  .listen-btn-row{ text-align:center; margin: 4px 0 6px; }
+  .listen-btn-row{ text-align:center; margin: 4px 0 6px; display:flex; gap:10px; justify-content:center; align-items:center; }
 
   /* file view */
   .drop{
@@ -253,6 +254,7 @@
     <div class="panel">
       <div class="listen-btn-row">
         <button class="btn primary" id="micBtn">Start listening</button>
+        <button class="btn" id="holdBtn" disabled>Hold</button>
       </div>
       <div class="swara-display">
         <div class="swara-big" id="liveSwara">—</div>
@@ -432,7 +434,9 @@
 
   // ---------- LIVE mode ----------
   let audioCtx = null, analyser = null, micStream = null, micActive = false, rafId = null;
+  let holdMode = false, holdTime = 0; // freezes the scrolling graph view without losing incoming data
   const micBtn = document.getElementById('micBtn');
+  const holdBtn = document.getElementById('holdBtn');
   const liveSwaraEl = document.getElementById('liveSwara');
   const liveSwaraSub = document.getElementById('liveSwaraSub');
   const centsFill = document.getElementById('centsFill');
@@ -445,7 +449,7 @@
     liveCanvas.width = Math.max(300, Math.round(rect.width * 2));
     liveCanvas.height = Math.round(320 * 2);
   }
-  window.addEventListener('resize', function(){ resizeCanvas(); drawLiveGraph(liveHistory.length ? liveHistory[liveHistory.length-1].t : 0); });
+  window.addEventListener('resize', function(){ resizeCanvas(); drawLiveGraph(holdMode ? holdTime : (liveHistory.length ? liveHistory[liveHistory.length-1].t : 0)); });
   resizeCanvas();
 
   // History buffer of raw (undebounced) pitch samples, so fast ornaments
@@ -465,7 +469,11 @@
     lctx.fillRect(0, 0, W, H);
 
     const labelW = Math.round(30 * (W/1200)); // reserve a small left margin for labels
-    lctx.font = Math.max(9, Math.round(H/34)) + 'px Manrope, sans-serif';
+    // Font size must scale with how tightly the semitone gridlines are packed
+    // (H / number of gridlines), not just canvas height on its own — that
+    // mismatch was what made adjacent swara labels overlap each other.
+    const lineSpacing = H / (SEMI_RANGE * 2); // canvas px between adjacent semitone lines
+    lctx.font = Math.max(8, Math.min(Math.round(H/34), Math.round(lineSpacing * 0.62))) + 'px Manrope, sans-serif';
     lctx.textBaseline = 'middle';
 
     for (let s = -SEMI_RANGE; s <= SEMI_RANGE; s++){
@@ -502,7 +510,9 @@
   function pushLiveSample(now, semis){
     liveHistory.push({ t: now, semis: semis });
     while (liveHistory.length && now - liveHistory[0].t > GRAPH_WINDOW_SEC + 0.5) liveHistory.shift();
-    drawLiveGraph(now);
+    // Keep recording samples even while held, so nothing is lost — just
+    // don't let the visible window scroll until the view is released.
+    drawLiveGraph(holdMode ? holdTime : now);
   }
 
   drawLiveGraph(0);
@@ -523,11 +533,25 @@
     if (micActive) stopMic(); else startMic();
   });
 
+  holdBtn.addEventListener('click', function(){
+    if (!micActive) return;
+    holdMode = !holdMode;
+    if (holdMode){
+      holdTime = liveHistory.length ? liveHistory[liveHistory.length-1].t : (audioCtx ? audioCtx.currentTime : 0);
+      holdBtn.textContent = 'Resume';
+      holdBtn.classList.add('held');
+    } else {
+      holdBtn.textContent = 'Hold';
+      holdBtn.classList.remove('held');
+      drawLiveGraph(audioCtx ? audioCtx.currentTime : holdTime);
+    }
+  });
+
   function startMic(){
     liveStatus.textContent = '';
     liveStatus.className = 'status-msg';
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:true } })
-        .then(function(stream){
+      .then(function(stream){
         micStream = stream;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -541,6 +565,10 @@
         micActive = true;
         micBtn.textContent = 'Stop listening';
         micBtn.classList.add('danger');
+        holdMode = false;
+        holdBtn.disabled = false;
+        holdBtn.textContent = 'Hold';
+        holdBtn.classList.remove('held');
         liveHistory = [];
         loopLive();
       })
@@ -558,6 +586,10 @@
     if (audioCtx) audioCtx.close();
     micBtn.textContent = 'Start listening';
     micBtn.classList.remove('danger');
+    holdMode = false;
+    holdBtn.disabled = true;
+    holdBtn.textContent = 'Hold';
+    holdBtn.classList.remove('held');
     liveSwaraEl.textContent = '—';
     liveSwaraEl.classList.remove('active');
     liveSwaraSub.textContent = 'Waiting for sound…';
