@@ -537,4 +537,245 @@
 
   let tapSamples = [];
   let pendingIdx = null, pendingCount = 0, lastShownIdx = null;
-  c
+  const DEBOUNCE_FRAMES = 2;
+
+  function loopLive(){
+    if (!micActive) return;
+    const buf = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(buf);
+    const freq = autoCorrelate(buf, audioCtx.sampleRate);
+
+    if (freq > 0){
+      if (tapSaMode){
+        tapSamples.push(freq);
+        if (tapSamples.length >= 20){
+          const sorted = tapSamples.slice().sort((a,b)=>a-b);
+          const median = sorted[Math.floor(sorted.length/2)];
+          saFreq = median;
+          updateSaFreqLabel();
+          // snap dropdown to nearest listed note for reference
+          let bestMidi = 60, bestDiff = Infinity;
+          for (let m=48; m<=84; m++){
+            const d = Math.abs(midiToFreq(m) - median);
+            if (d < bestDiff){ bestDiff = d; bestMidi = m; }
+          }
+          try{ localStorage.setItem('swaraFinderSaMidi', String(bestMidi)); }catch(e){}
+          tapSaMode = false;
+          tapSamples = [];
+          liveStatus.textContent = 'Sa set to ' + median.toFixed(1) + ' Hz.';
+          liveStatus.className = 'status-msg';
+        }
+      }
+      const result = freqToSwara(freq);
+
+      if (result.idx === pendingIdx){ pendingCount++; } else { pendingIdx = result.idx; pendingCount = 1; }
+      if (pendingCount >= DEBOUNCE_FRAMES) lastShownIdx = pendingIdx;
+
+      if (lastShownIdx !== null){
+        liveSwaraEl.textContent = SWARA[lastShownIdx];
+        liveSwaraEl.classList.add('active');
+        const octLabel = result.octRel === 0 ? '' : (result.octRel > 0 ? ' (upper octave)' : ' (lower octave)');
+        liveSwaraSub.textContent = SWARA_FULL[lastShownIdx] + octLabel + ' · ' + freq.toFixed(1) + ' Hz · ' + (result.cents>=0?'+':'') + result.cents + ' cents';
+      }
+      const pct = 50 + Math.max(-50, Math.min(50, result.cents/50*50));
+      centsFill.style.left = pct + '%';
+      drawLiveColumn(result.semis);
+    } else {
+      pendingIdx = null; pendingCount = 0; lastShownIdx = null;
+      liveSwaraEl.classList.remove('active');
+      if (!tapSaMode) liveSwaraSub.textContent = 'Waiting for sound…';
+      drawLiveColumn(null);
+    }
+    rafId = requestAnimationFrame(loopLive);
+  }
+
+  // ---------- FILE analysis mode ----------
+  const dropZone = document.getElementById('dropZone');
+  const fileInput = document.getElementById('fileInput');
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressLabel = document.getElementById('progressLabel');
+  const fileStatus = document.getElementById('fileStatus');
+  const fileResults = document.getElementById('fileResults');
+
+  dropZone.addEventListener('click', ()=> fileInput.click());
+  dropZone.addEventListener('dragover', function(e){ e.preventDefault(); dropZone.classList.add('drag'); });
+  dropZone.addEventListener('dragleave', function(){ dropZone.classList.remove('drag'); });
+  dropZone.addEventListener('drop', function(e){
+    e.preventDefault(); dropZone.classList.remove('drag');
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', function(){
+    if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
+  });
+
+  function handleFile(file){
+    fileStatus.textContent = '';
+    fileStatus.className = 'status-msg';
+    fileResults.classList.remove('active');
+    progressWrap.classList.add('active');
+    progressFill.style.width = '0%';
+    progressLabel.textContent = 'Reading file…';
+
+    const reader = new FileReader();
+    reader.onload = function(e){
+      const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+      tempCtx.decodeAudioData(e.target.result).then(function(audioBuffer){
+        tempCtx.close();
+        analyzeBuffer(audioBuffer);
+      }).catch(function(err){
+        progressWrap.classList.remove('active');
+        fileStatus.textContent = "Couldn't decode that audio file. Try an mp3 or wav.";
+        fileStatus.className = 'status-msg error';
+      });
+    };
+    reader.onerror = function(){
+      progressWrap.classList.remove('active');
+      fileStatus.textContent = 'Could not read the file.';
+      fileStatus.className = 'status-msg error';
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function analyzeBuffer(audioBuffer){
+    const MAX_SECONDS = 180;
+    const TARGET_RATE = 8000;
+    const duration = Math.min(audioBuffer.duration, MAX_SECONDS);
+    const frameCount = Math.ceil(duration * TARGET_RATE);
+
+    progressLabel.textContent = 'Resampling…';
+    const offlineCtx = new OfflineAudioContext(1, frameCount, TARGET_RATE);
+    const src = offlineCtx.createBufferSource();
+
+    let workingBuffer = audioBuffer;
+    if (audioBuffer.duration > MAX_SECONDS){
+      const trimmed = offlineCtx.createBuffer(audioBuffer.numberOfChannels, Math.floor(MAX_SECONDS*audioBuffer.sampleRate), audioBuffer.sampleRate);
+      for (let ch=0; ch<audioBuffer.numberOfChannels; ch++){
+        trimmed.copyToChannel(audioBuffer.getChannelData(ch).subarray(0, trimmed.length), ch);
+      }
+      workingBuffer = trimmed;
+    }
+    src.buffer = workingBuffer;
+    src.connect(offlineCtx.destination);
+    src.start(0);
+
+    offlineCtx.startRendering().then(function(rendered){
+      const data = rendered.getChannelData(0);
+      const WINDOW = 1024, HOP = 512;
+      const totalWindows = Math.max(1, Math.floor((data.length - WINDOW) / HOP));
+      const results = [];
+      let i = 0;
+      const BATCH = 40;
+
+      progressLabel.textContent = 'Finding swaras…';
+
+      function processBatch(){
+        const end = Math.min(totalWindows, i + BATCH);
+        for (; i < end; i++){
+          const start = i * HOP;
+          const win = data.subarray(start, start + WINDOW);
+          const freq = autoCorrelate(win, TARGET_RATE);
+          const t = start / TARGET_RATE;
+          results.push({ t, freq: freq > 0 ? freq : null });
+        }
+        progressFill.style.width = Math.round((i/totalWindows)*100) + '%';
+        if (i < totalWindows){
+          setTimeout(processBatch, 0);
+        } else {
+          finishAnalysis(results, duration);
+        }
+      }
+      processBatch();
+    }).catch(function(err){
+      progressWrap.classList.remove('active');
+      fileStatus.textContent = 'Something went wrong analyzing that file.';
+      fileStatus.className = 'status-msg error';
+    });
+  }
+
+  function finishAnalysis(results, duration){
+    progressWrap.classList.remove('active');
+
+    // build swara-per-window, then collapse into runs
+    const perWindow = results.map(function(r){
+      if (r.freq === null) return null;
+      const s = freqToSwara(r.freq);
+      return s ? s.idx : null;
+    });
+
+    const MIN_RUN_WINDOWS = 3; // ~ a bit under 200ms at hop 512/8000Hz
+    const runs = [];
+    let curIdx = null, curStart = 0, curCount = 0;
+    for (let i=0;i<perWindow.length;i++){
+      const idx = perWindow[i];
+      if (idx === curIdx){
+        curCount++;
+      } else {
+        if (curIdx !== null && curCount >= MIN_RUN_WINDOWS){
+          runs.push({ idx: curIdx, start: results[curStart].t, end: results[i-1].t });
+        }
+        curIdx = idx; curStart = i; curCount = 1;
+      }
+    }
+    if (curIdx !== null && curCount >= MIN_RUN_WINDOWS){
+      runs.push({ idx: curIdx, start: results[curStart].t, end: results[perWindow.length-1].t });
+    }
+
+    if (runs.length === 0){
+      fileStatus.textContent = 'No clear melodic pitch was detected in this recording.';
+      fileStatus.className = 'status-msg error';
+      return;
+    }
+
+    // merge adjacent same-swara runs separated by only silence gaps
+    const merged = [];
+    runs.forEach(function(r){
+      const last = merged[merged.length-1];
+      if (last && last.idx === r.idx && (r.start - last.end) < 0.3){
+        last.end = r.end;
+      } else {
+        merged.push({ idx:r.idx, start:r.start, end:r.end });
+      }
+    });
+
+    // shape line
+    const shapeEl = document.getElementById('shapeLine');
+    shapeEl.innerHTML = merged.map(function(r){
+      const cls = /[A-Z]/.test(SWARA[r.idx]) ? (SWARA[r.idx]==='M' ? 'swara-v' : '') : 'swara-g';
+      return '<span class="' + cls + '">' + SWARA[r.idx] + '</span>';
+    }).join(' ');
+
+    // timeline
+    function fmtTime(t){
+      const m = Math.floor(t/60), s = Math.floor(t%60);
+      return m + ':' + (s<10?'0':'') + s;
+    }
+    const tlEl = document.getElementById('timeline');
+    tlEl.innerHTML = merged.map(function(r){
+      return '<div class="tl-row"><div class="tl-swara">' + SWARA[r.idx] + '</div>' +
+        '<div class="tl-name">' + SWARA_FULL[r.idx] + '</div>' +
+        '<div class="tl-time">' + fmtTime(r.start) + ' – ' + fmtTime(r.end) + '</div></div>';
+    }).join('');
+
+    // distribution by total duration
+    const totals = new Array(12).fill(0);
+    merged.forEach(function(r){ totals[r.idx] += (r.end - r.start); });
+    const grandTotal = totals.reduce((a,b)=>a+b, 0) || 1;
+    const distEl = document.getElementById('distChart');
+    const order = totals.map((v,idx)=>({v,idx})).sort((a,b)=>b.v-a.v).filter(o=>o.v>0);
+    distEl.innerHTML = order.map(function(o){
+      const pct = Math.round((o.v/grandTotal)*100);
+      return '<div class="dist-row"><div class="dist-label">' + SWARA[o.idx] + '</div>' +
+        '<div class="dist-track"><div class="dist-fill" style="width:' + pct + '%;"></div></div>' +
+        '<div class="dist-pct">' + pct + '%</div></div>';
+    }).join('');
+
+    fileResults.classList.add('active');
+    fileStatus.textContent = 'Analyzed ' + fmtTime(duration) + ' of audio, relative to Sa = ' + saFreq.toFixed(1) + ' Hz.';
+    fileStatus.className = 'status-msg';
+  }
+
+})();
+</script>
+</body>
+</html>
