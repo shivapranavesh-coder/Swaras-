@@ -461,6 +461,21 @@ function MPM(sr, W, fmin, fmax, kThresh){
     if (!keys.length || nmax < 0.3) return { f0: 0, clarity: nmax > 0 ? nmax : 0, rms: rms };
     var thr = kThresh * nmax, pick = keys[0];
     for (i = 0; i < keys.length; i++){ if (nsdf[keys[i]] >= thr){ pick = keys[i]; break; } }
+    // Bass-safe fundamental check: on low, harmonic-rich notes a strong
+    // harmonic can create a spurious short-lag (upper-octave) peak that
+    // clears the threshold above before the true, longer-lag fundamental
+    // peak is reached (short windows only fit a couple of true periods, so
+    // the fundamental's own peak can look weaker than a harmonic's).
+    // If a comparably strong lobe sits at a clean integer multiple of the
+    // chosen lag, it is almost certainly the real fundamental — the short
+    // lag is then just that harmonic re-matching itself — so walk out to
+    // the longest such well-supported multiple instead.
+    for (i = 0; i < keys.length; i++){
+      var kk = keys[i], ratio = kk / pick, mult = Math.round(ratio);
+      if (mult >= 2 && mult <= 4 && Math.abs(ratio - mult) < 0.08 && nsdf[kk] >= 0.92 * nsdf[pick]){
+        pick = kk;
+      }
+    }
     var a = nsdf[pick - 1], b = nsdf[pick], c = nsdf[pick + 1];
     var den = a - 2 * b + c, shift = den !== 0 ? 0.5 * (a - c) / den : 0;
     if (shift > 1 || shift < -1) shift = 0;
@@ -932,7 +947,7 @@ function bindSlider(id, outId, key, fmt){
   var el = $(id); el.value = cfg[key];
   function upd(){ cfg[key] = parseFloat(el.value); $(outId).textContent = fmt(cfg[key]); store.set(key, cfg[key]); }
   el.addEventListener('input', upd); upd();
-}
+  }
 bindSlider('thrDb', 'thrOut', 'thrDb', function(v){ return v + ' dB'; });
 bindSlider('smooth', 'smoothOut', 'smooth', function(v){ return String(v); });
 bindSlider('strict', 'strictOut', 'strict', function(v){ return String(v); });
@@ -1012,6 +1027,36 @@ function detectMix(dt){
 }
 
 function median(a){ return DSP.median(a); }
+
+// A plain median of raw midi readings can be fooled if a handful of frames
+// (more likely on low/bass notes — see the MPM comment in dsp.js) latched
+// onto the wrong octave: the result can land on a value that isn't close to
+// *any* of the notes actually sung. This instead finds the dominant pitch
+// class first (circular, octave-independent), then picks the most common
+// octave among the readings that agree with it, and only takes the median
+// within that agreeing subset.
+function robustPitchModeMidi(vals){
+  if (!vals.length) return NaN;
+  // 1) circular histogram over pitch class (mod 12) in 20-cent bins to find
+  //    the dominant pitch class regardless of which octave each reading fell in.
+  var nBins = 60, hist = new Array(nBins).fill(0); // 12 semitones / 60 bins = 20 cents/bin
+  for (var i = 0; i < vals.length; i++){
+    var pc = ((vals[i] % 12) + 12) % 12;
+    hist[Math.floor(pc / 12 * nBins) % nBins]++;
+  }
+  // smooth circularly so a peak split across two adjacent bins isn't missed
+  var sm = hist.map(function(_, i){ return hist[(i - 1 + nBins) % nBins] + hist[i] + hist[(i + 1) % nBins]; });
+  var bestBin = 0; for (i = 1; i < nBins; i++) if (sm[i] > sm[bestBin]) bestBin = i;
+  var targetPc = (bestBin + 0.5) / nBins * 12;
+  // 2) keep only readings within 2.5 semitones of that pitch class (allowing for
+  //    octave register), then take the plain median of just that agreeing subset.
+  var kept = vals.filter(function(v){
+    var pc = ((v % 12) + 12) % 12;
+    var d = Math.abs(pc - targetPc); d = Math.min(d, 12 - d);
+    return d <= 2.5;
+  });
+  return median(kept.length >= Math.max(5, vals.length * 0.35) ? kept : vals);
+}
 
 function loop(){
   if (!micActive) return;
@@ -1198,7 +1243,7 @@ function handleSaCapture(t){
   if (t < saCapture.until) return;
   var c = saCapture; saCapture = null;
   if (c.vals.length >= 15){
-    var mm = median(c.vals); setSaFromMidi(mm, true);
+    var mm = robustPitchModeMidi(c.vals); setSaFromMidi(mm, true);
     setStatus(liveStatus, 'Sa set to ' + noteName(saMidi()) + ' (' + saFreq().toFixed(1) + ' Hz).', 'ok');
   } else setStatus(liveStatus, 'Could not hear a steady note. Try again a little louder.', 'error');
   if (c.stopAfter){ var msg = liveStatus.textContent, k = liveStatus.className; stopListening(); liveStatus.textContent = msg; liveStatus.className = k; }
@@ -1449,88 +1494,5 @@ function renderDist(h){
     html += '<div class="dist-row"><span class="dist-label">' + SWARA[idx] + '</span><div class="dist-track"><div class="dist-fill" style="width:' + (maxSec ? (100 * h.sec[idx] / maxSec) : 0).toFixed(1) + '%"></div></div><span class="dist-pct">' + pct.toFixed(0) + '%</span></div>';
   });
   $('distChart').innerHTML = html;
-}
-
-/* --- contour canvas (follows the player) --- */
-function computeContourRange(){
-  var a = analysis, sa = saMidi(), vals = [], i;
-  for (i = 0; i < a.midi.length; i += 2) if (!isNaN(a.midi[i])) vals.push(a.midi[i] - sa);
-  if (!vals.length){ contourRange = { lo: -6, hi: 18 }; return; }
-  vals.sort(function(x, y){ return x - y; });
-  var lo = Math.floor(vals[Math.floor(0.02 * (vals.length - 1))]) - 1, hi = Math.ceil(vals[Math.floor(0.98 * (vals.length - 1))]) + 1;
-  while (hi - lo < 13){ lo--; hi++; }
-  if (hi - lo > 40){ var c = (hi + lo) / 2; lo = Math.round(c - 20); hi = Math.round(c + 20); }
-  contourRange = { lo: lo, hi: hi };
-}
-var WIN_BEFORE = 3, WIN_AFTER = 9;
-function drawContour(){
-  var W = fileCanvas.width, H = fileCanvas.height, dpr = H / 280;
-  fctx.fillStyle = '#0F0A05'; fctx.fillRect(0, 0, W, H);
-  if (!analysis || !notes) return;
-  var a = analysis, sa = saMidi(), lo = contourRange.lo, hi = contourRange.hi, tp = player.currentTime || 0;
-  var labelW = Math.round(26 * dpr), span = WIN_BEFORE + WIN_AFTER, t0 = tp - WIN_BEFORE, t1 = tp + WIN_AFTER;
-  function yOf(s){ return H - (s - lo) / (hi - lo) * H; }
-  function xOf(t){ return labelW + (W - labelW) * (t - t0) / span; }
-  var rowH = H / (hi - lo), s, i;
-  fctx.font = Math.max(9 * dpr, Math.min(14 * dpr, rowH * 0.62)) + 'px Manrope, sans-serif'; fctx.textBaseline = 'middle';
-  for (s = Math.ceil(lo); s <= Math.floor(hi); s++){
-    var idx = ((s % 12) + 12) % 12, isSa = idx === 0, y = yOf(s);
-    fctx.strokeStyle = isSa ? 'rgba(217,165,68,0.6)' : 'rgba(60,47,23,0.7)'; fctx.lineWidth = (isSa ? 1.6 : 1) * dpr;
-    fctx.beginPath(); fctx.moveTo(labelW, y); fctx.lineTo(W, y); fctx.stroke();
-    fctx.fillStyle = isSa ? 'rgba(240,194,103,0.95)' : 'rgba(171,152,119,0.62)';
-    fctx.fillText(SWARA[idx] + (s >= 12 ? "'" : s < 0 ? ',' : ''), 4 * dpr, y);
   }
-  // note bars
-  var ev = notes.main;
-  fctx.font = 'bold ' + Math.max(10 * dpr, Math.min(15 * dpr, rowH * 0.7)) + 'px Manrope, sans-serif';
-  for (i = 0; i < ev.length; i++){
-    var e = ev[i]; if (e.t1 < t0) continue; if (e.t0 > t1) break;
-    var x0 = Math.max(labelW, xOf(e.t0)), x1 = Math.min(W, xOf(e.t1)), yc = yOf(e.n), bh = Math.max(4 * dpr, rowH * 0.62);
-    if (x1 <= x0) continue;
-    fctx.fillStyle = 'rgba(217,165,68,0.22)'; fctx.fillRect(x0, yc - bh / 2, x1 - x0, bh);
-    fctx.fillStyle = 'rgba(240,194,103,0.9)';
-    if (x1 - x0 > 12 * dpr) fctx.fillText(swText(e.n), x0 + 3 * dpr, yc);
-  }
-  // pitch trace
-  var f0 = Math.max(0, Math.floor((t0 - a.t0) / a.hop)), f1 = Math.min(a.midi.length - 1, Math.ceil((t1 - a.t0) / a.hop));
-  fctx.strokeStyle = '#F6D58F'; fctx.lineWidth = Math.max(1.6, 2 * dpr); fctx.lineJoin = 'round'; fctx.lineCap = 'round';
-  var drawing = false;
-  for (i = f0; i <= f1; i++){
-    var m = a.midi[i];
-    if (isNaN(m)){ if (drawing){ fctx.stroke(); drawing = false; } continue; }
-    var xx = xOf(a.t0 + i * a.hop), yy = yOf(m - sa);
-    if (!drawing){ fctx.beginPath(); fctx.moveTo(xx, yy); drawing = true; } else fctx.lineTo(xx, yy);
-  }
-  if (drawing) fctx.stroke();
-  // playhead
-  var px = xOf(tp);
-  fctx.strokeStyle = 'rgba(208,102,74,0.95)'; fctx.lineWidth = 2 * dpr;
-  fctx.beginPath(); fctx.moveTo(px, 0); fctx.lineTo(px, H); fctx.stroke();
-  updateNow(tp);
-}
-function updateNow(tp){
-  var a = analysis; if (!a) return;
-  var i = Math.round((tp - a.t0) / a.hop), m = (i >= 0 && i < a.midi.length) ? a.midi[i] : NaN;
-  if (isNaN(m)){ $('nowSw').innerHTML = '—'; $('nowTxt').textContent = player.paused ? 'Press play' : 'No singing here'; return; }
-  var semis = m - saMidi(), n = Math.round(semis), c = Math.round((semis - n) * 100);
-  $('nowSw').innerHTML = swHTML(n);
-  $('nowTxt').textContent = SWARA_FULL[((n % 12) + 12) % 12] + ' · ' + noteName(m) + ' · ' + (c > 0 ? '+' : '') + c + ' ¢';
-}
-function tickPlay(){ if (!playing) return; drawContour(); requestAnimationFrame(tickPlay); }
-player.addEventListener('play', function(){ playing = true; tickPlay(); });
-['pause','ended'].forEach(function(ev){ player.addEventListener(ev, function(){ playing = false; drawContour(); }); });
-['seeked','timeupdate','loadedmetadata'].forEach(function(ev){ player.addEventListener(ev, function(){ if (!playing) drawContour(); }); });
-fileCanvas.addEventListener('click', function(e){
-  if (!analysis) return;
-  var rect = fileCanvas.getBoundingClientRect(), fx = (e.clientX - rect.left) / rect.width;
-  var labelFrac = 26 / rect.width;
-  var frac = Math.max(0, (fx - labelFrac) / (1 - labelFrac));
-  seekTo((player.currentTime || 0) - WIN_BEFORE + frac * (WIN_BEFORE + WIN_AFTER), false);
-});
-
-/* expose a tiny hook so the page can be tested without a microphone */
-window.__swara = { analyzeBlob: acceptBlob, getAnalysis: function(){ return analysis; }, getNotes: function(){ return notes; }, setSa: setSaFromMidi };
-})();
-</script>
-</body>
-</html>
+  
