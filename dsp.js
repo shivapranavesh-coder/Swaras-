@@ -120,6 +120,21 @@ function MPM(sr, W, fmin, fmax, kThresh){
     if (!keys.length || nmax < 0.3) return { f0: 0, clarity: nmax > 0 ? nmax : 0, rms: rms };
     var thr = kThresh * nmax, pick = keys[0];
     for (i = 0; i < keys.length; i++){ if (nsdf[keys[i]] >= thr){ pick = keys[i]; break; } }
+    // Bass-safe fundamental check: on low, harmonic-rich notes a strong
+    // harmonic can create a spurious short-lag (upper-octave) peak that
+    // clears the threshold above before the true, longer-lag fundamental
+    // peak is reached (short windows only fit a couple of true periods, so
+    // the fundamental's own peak can look weaker than a harmonic's).
+    // If a comparably strong lobe sits at a clean integer multiple of the
+    // chosen lag, it is almost certainly the real fundamental — the short
+    // lag is then just that harmonic re-matching itself — so walk out to
+    // the longest such well-supported multiple instead.
+    for (i = 0; i < keys.length; i++){
+      var kk = keys[i], ratio = kk / pick, mult = Math.round(ratio);
+      if (mult >= 2 && mult <= 4 && Math.abs(ratio - mult) < 0.08 && nsdf[kk] >= 0.92 * nsdf[pick]){
+        pick = kk;
+      }
+    }
     var a = nsdf[pick - 1], b = nsdf[pick], c = nsdf[pick + 1];
     var den = a - 2 * b + c, shift = den !== 0 ? 0.5 * (a - c) / den : 0;
     if (shift > 1 || shift < -1) shift = 0;
@@ -420,7 +435,7 @@ function cleanTrack(midi, hopSec, o){
       var e = i; while (e < T && isNaN(out[e])) e++;
       if (i > 0 && e < T && e - i <= gapMax && Math.abs(out[e] - out[i - 1]) < 2){
         for (j = i; j < e; j++) out[j] = out[i - 1] + (out[e] - out[i - 1]) * (j - i + 1) / (e - i + 1);
-      }
+ }
       i = e;
     } else i++;
   }
@@ -522,3 +537,4 @@ return {
 };
 })();
 /* ==================== /DSP CORE ==================== */
+    
